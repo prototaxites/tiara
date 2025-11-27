@@ -1,19 +1,18 @@
 import gzip
-from typing import Dict, Union, List
-import warnings
 from contextlib import suppress
+from typing import Dict, Iterator, List, Tuple, Union
 
-from Bio.SeqIO.FastaIO import SimpleFastaParser
-from tqdm import tqdm
-from joblib import Parallel, delayed
-
-from skorch import NeuralNetClassifier
+import numpy as np
 import torch
+from Bio.SeqIO.FastaIO import SimpleFastaParser
+from joblib import Parallel, delayed
+from skorch import NeuralNetClassifier
+from tqdm import tqdm
 
-from tiara.src.prediction import Prediction, SingleResult
 from tiara.src.models import NNet1, NNet2
-from tiara.src.transformations import Transformer, TfidfWeighter
-from tiara.src.utilities import parse_params, chop, time_context_manager
+from tiara.src.prediction import Prediction, SingleResult
+from tiara.src.transformations import TfidfWeighter, Transformer
+from tiara.src.utilities import chop, parse_params, time_context_manager
 
 
 def fun(seq, layer, transformer, fragment_len):
@@ -94,107 +93,222 @@ class Classification:
             for layer in range(self.layers)
         ]
 
-    def classify(self, sequences_fname: str, verbose=False) -> List[SingleResult]:
-        """Perform a two-step classification.
+    def _sequence_generator(self, sequences_fname: str) -> Iterator[Tuple[str, str]]:
+        """Memory-efficient generator that yields sequences from a FASTA file.
+
+        Parameters
+        ----------
+            sequences_fname: path to FASTA file (can be gzipped)
+
+        Yields
+        ------
+            (description, sequence) tuples
+        """
+        if sequences_fname.endswith(".gz"):
+            with gzip.open(sequences_fname, "rt") as sequences_handle:
+                for desc, seq in SimpleFastaParser(sequences_handle):
+                    if len(seq) >= self.min_len:
+                        yield desc, seq
+        else:
+            with open(sequences_fname, "r") as sequences_handle:
+                for desc, seq in SimpleFastaParser(sequences_handle):
+                    if len(seq) >= self.min_len:
+                        yield desc, seq
+
+    def _transform_batch(
+        self, sequences: List[Tuple[str, str]], layer: int, verbose: bool = False
+    ) -> Iterator[Tuple[str, str, np.ndarray]]:
+        """Transform a batch of sequences using parallel processing.
+
+        Parameters
+        ----------
+            sequences: list of (description, sequence) tuples
+            layer: which predictor layer to use
+            verbose: whether to show progress bar
+
+        Yields
+        ------
+            (description, sequence, transformation) tuples
+        """
+        do = delayed(fun)
+        executor = Parallel(n_jobs=self.threads)
+
+        descs = [x[0] for x in sequences]
+        seqs = [x[1] for x in sequences]
+
+        tasks = (
+            do(
+                seq,
+                layer,
+                self.predictors[layer].transformer,
+                self.params[layer]["fragment_len"],
+            )
+            for seq in seqs
+        )
+
+        cont_manager = (
+            time_context_manager(f"Calculating layer {layer} sequence representations")
+            if verbose
+            else suppress()
+        )
+
+        with cont_manager:
+            transformations = executor(tasks)
+
+        for desc, seq, trans in zip(descs, seqs, transformations):
+            yield desc, seq, trans
+
+    def _predict_batch(
+        self,
+        transformed_records: Iterator[Tuple[str, str, np.ndarray]],
+        layer: int,
+        verbose: bool = False,
+    ) -> List[SingleResult]:
+        """Make predictions on a batch of transformed records.
+
+        Parameters
+        ----------
+            transformed_records: iterator of (description, sequence, transformation) tuples
+            layer: which predictor layer to use
+            verbose: whether to show progress bar
+
+        Returns
+        -------
+            predictions: list of SingleResult objects
+        """
+        predictions = []
+
+        if verbose:
+            print(f"Performing layer {layer} classification.")
+            iterator = tqdm(transformed_records)
+        else:
+            iterator = transformed_records
+
+        for desc, seq, bow in iterator:
+            prediction = self.predictors[layer].make_prediction((desc, seq, bow))
+            predictions.append(prediction)
+
+        return predictions
+
+    def classify(
+        self, sequences_fname: str, verbose=False, batch_size: int = 1000
+    ) -> List[SingleResult]:
+        """Perform a two-step classification with memory-efficient streaming.
 
         Parameters
         ----------
             sequences_fname : a path to fasta file to classify
+            verbose : whether to show progress information
+            batch_size : number of sequences to process in each batch
 
         Returns
         -------
-            predictions: a list of lists containing SingleResult objects.
+            predictions: a list of SingleResult objects
         """
-        if sequences_fname.endswith(".gz"):
-            with gzip.open(sequences_fname, "rt") as sequences_handle:
-                seqs = list(SimpleFastaParser(sequences_handle))
-        else:
-            with open(sequences_fname, "r") as sequences_handle:
-                seqs = list(SimpleFastaParser(sequences_handle))
-        seqs = [x for x in seqs if len(x[1]) >= self.min_len]
+        all_predictions = []
 
-        do = delayed(fun)
-        executor = Parallel(n_jobs=self.threads)
-        tasks = (
-            do(x[1], 0, self.predictors[0].transformer, self.params[0]["fragment_len"])
-            for x in seqs
-        )
-        cont_manager = (
-            time_context_manager("Calculating first stage sequence representations")
-            if verbose
-            else suppress()
-        )
-        with cont_manager:
-            seqs = list(
-                zip([x[0] for x in seqs], [x[1] for x in seqs], executor(tasks))
-            )
+        # Process sequences in batches
+        batch = []
+        for desc, seq in self._sequence_generator(sequences_fname):
+            batch.append((desc, seq))
 
-        # Two-step classification
-        if verbose:
-            print("Performing first stage of classification.")
-            fst_stage_results = []
-            for seq in tqdm(seqs):
-                fst_stage_results.append(self.predictors[0].make_prediction(seq))
-        else:
-            # tasks = (do(seq) for seq in seqs)
-            # fst_stage_results = executor(tasks)
-            fst_stage_results = [
-                self.predictors[0].make_prediction(seq) for seq in seqs
-            ]
-        if verbose:
-            print("Done")
-        predictions = []
-        to_second_stage = []
-        for prediction in fst_stage_results:
-            if prediction.cls[0] == "organelle":
-                to_second_stage.append(prediction)
-            else:
-                predictions.append(prediction)
-        if to_second_stage:
-            tasks = (
-                do(
-                    record.seq,
-                    1,
-                    self.predictors[1].transformer,
-                    self.params[1]["fragment_len"],
-                )
-                for record in to_second_stage
-            )
-            cont_manager = (
-                time_context_manager(
-                    "Calculating second stage sequence representations"
-                )
-                if verbose
-                else suppress()
-            )
-            with cont_manager:
-                seqs2 = list(
-                    zip(
-                        [record.desc for record in to_second_stage],
-                        [record.seq for record in to_second_stage],
-                        executor(tasks),
+            if len(batch) >= batch_size:
+                # Process first stage on this batch
+                stage1_results = self._process_batch_stage1(batch, verbose)
+
+                # Separate results and collect stage 2 candidates
+                stage2_candidates = []
+                for prediction in stage1_results:
+                    if prediction.cls[0] == "organelle":
+                        stage2_candidates.append(prediction)
+                    else:
+                        all_predictions.append(prediction)
+
+                # Process stage 2 if we have candidates
+                if stage2_candidates:
+                    stage2_results = self._process_batch_stage2(
+                        stage2_candidates, verbose
                     )
-                )
-            if verbose:
-                print("Performing second stage of classification.")
-                snd_stage_results = []
-                for seq in tqdm(seqs2):
-                    snd_stage_results.append(self.predictors[1].make_prediction(seq))
-            else:
-                # tasks = (do_second_stage(seq) for seq in seqs2)
-                # snd_stage_results = executor(tasks)
-                snd_stage_results = [
-                    self.predictors[1].make_prediction(seq) for seq in seqs2
-                ]
-            for fst, snd in zip(to_second_stage, snd_stage_results):
-                assert fst.desc == snd.desc, "Descriptions not the same"
-                assert fst.seq == snd.seq, "Sequences not the same"
-                predictions.append(
-                    SingleResult(
-                        desc=fst.desc,
-                        seq=fst.seq,
-                        cls=[fst.cls[0], snd.cls[1]],
-                        probs=[fst.probs[0], snd.probs[1]],
-                    )
-                )
+                    all_predictions.extend(stage2_results)
+
+                batch = []
+
+        # Process remaining sequences
+        if batch:
+            stage1_results = self._process_batch_stage1(batch, verbose)
+
+            stage2_candidates = []
+            for prediction in stage1_results:
+                if prediction.cls[0] == "organelle":
+                    stage2_candidates.append(prediction)
+                else:
+                    all_predictions.append(prediction)
+
+            if stage2_candidates:
+                stage2_results = self._process_batch_stage2(stage2_candidates, verbose)
+                all_predictions.extend(stage2_results)
+
+        return all_predictions
+
+    def _process_batch_stage1(
+        self, batch: List[Tuple[str, str]], verbose: bool = False
+    ) -> List[SingleResult]:
+        """Process first stage classification for a batch of sequences.
+
+        Parameters
+        ----------
+            batch: list of (description, sequence) tuples
+            verbose: whether to show progress
+
+        Returns
+        -------
+            predictions: list of SingleResult objects from stage 1
+        """
+        # Transform sequences
+        transformed = list(self._transform_batch(batch, layer=0, verbose=verbose))
+
+        # Make predictions
+        predictions = self._predict_batch(iter(transformed), layer=0, verbose=verbose)
+
         return predictions
+
+    def _process_batch_stage2(
+        self, stage1_results: List[SingleResult], verbose: bool = False
+    ) -> List[SingleResult]:
+        """Process second stage classification for sequences classified as 'organelle'.
+
+        Parameters
+        ----------
+            stage1_results: list of SingleResult objects from stage 1 that need stage 2 classification
+            verbose: whether to show progress
+
+        Returns
+        -------
+            predictions: list of SingleResult objects with stage 2 classification
+        """
+        # Prepare batch for stage 2
+        batch = [(record.desc, record.seq) for record in stage1_results]
+
+        # Transform sequences
+        transformed = list(self._transform_batch(batch, layer=1, verbose=verbose))
+
+        # Make predictions
+        stage2_results = self._predict_batch(
+            iter(transformed), layer=1, verbose=verbose
+        )
+
+        # Merge stage 1 and stage 2 results
+        final_results = []
+        for stage1, stage2 in zip(stage1_results, stage2_results):
+            assert stage1.desc == stage2.desc, "Descriptions not the same"
+            assert stage1.seq == stage2.seq, "Sequences not the same"
+            final_results.append(
+                SingleResult(
+                    desc=stage1.desc,
+                    seq=stage1.seq,
+                    cls=[stage1.cls[0], stage2.cls[1]],
+                    probs=[stage1.probs[0], stage2.probs[1]],
+                )
+            )
+
+        return final_results
